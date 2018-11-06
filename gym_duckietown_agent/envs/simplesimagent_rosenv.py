@@ -9,8 +9,14 @@ import numpy as np
 from gym_duckietown_agent.config import CAMERA_HEIGHT, CAMERA_WIDTH
 from matplotlib import pyplot as plt
 
+import rospy
+import cv2
+from std_msgs.msg import Bool, String
+from sensor_msgs.msg import CompressedImage
 
-class SimpleSimAgentEnv(gym.Env):
+
+
+class SimpleSimAgentRosEnv(gym.Env):
     """
     Remote client for the simple Duckietown road simulator.
     Draws a road with turns using OpenGL, and simulates
@@ -30,6 +36,13 @@ class SimpleSimAgentEnv(gym.Env):
         # hostname of the `gym-duckietown-server` container, but in
         # the local test environment this will just map to localhost
         host = os.getenv("DUCKIETOWN_SERVER", "localhost")
+
+        self.action_sub = rospy.Subscriber('/cmd', String, self._action_cb)
+        self.reset_sub = rospy.Subscriber('/2', Bool, self._reset_cb)
+
+        self.cam_pub = rospy.Publisher('/img/compressed', CompressedImage, queue_size=10)
+        self.action_debug_pub = rospy.Publisher('/1', String, queue_size=10)
+        self.action = [0., 0.]
 
         # Create ZMQ connection
         self.sim = RemoteRobot(host, silent=self.silent)
@@ -65,6 +78,29 @@ class SimpleSimAgentEnv(gym.Env):
         self.seed()
         self.reset()  # FIXME: I'm quite sure this has to be called by the agent by gym convention
 
+        rospy.init_node('RemoteRobotRos')
+
+    def _action_cb(self, msg):
+        action = msg.data.split()
+
+        assert len(action) == 2
+        self.action = np.array(action)
+
+
+    def _reset_cb(self, msg):
+        if msg.data == True:
+            self.reset()
+
+    def _publish_img(self, obs):
+        # Publish the Numpy Array as Compressed Image)
+        obs = cv2.cvtColor(obs, cv2.COLOR_BGR2RGB)
+        img_msg = CompressedImage()
+        img_msg.header.stamp = rospy.Time.now()
+        img_msg.format = "jpeg"
+        img_msg.data = np.array(cv2.imencode('.jpg', obs)[1]).tostring()
+
+        self.cam_pub.publish(img_msg)
+
     def reset(self):
         """
         Reset the simulation at the start of a new episode
@@ -90,23 +126,28 @@ class SimpleSimAgentEnv(gym.Env):
         # self.np_random, _ = seeding.np_random(seed)
         return [seed]
 
-    def step(self, action):
+    def step(self):
         """ Steps the simulation. Run action and get observation and reward.
 
         :param action: tuple|list|ndarray of exactly 2 floating point values
         each in range [-1,1] indicating the forward/backward speed and the
         steering angle respectively.
 
-        :return: tuple of observation (image as ndarray), reward (float)
+        :return: tuple of observation (image as ndarray), reward (float
         scalar), done (bool), misc (empty dict)
         """
-        assert len(action) == 2
-        action = np.array(action)
+        obs, rew, done, misc = self.sim.step(self.action, with_observation=True)
+        self._publish_img(obs)
 
-
-        obs, rew, done, misc = self.sim.step(action, with_observation=True)
+        # TODO: Does reward, done, and misc also need to be published?
 
         return obs, rew, done, misc
+
+    def publish_action(self, action):
+        act_msg = String()
+        act_msg.data = "{} {}".format(action[0], action[1])
+
+        self.action_debug_pub.publish(act_msg)
 
     def _create_window(self):
         """ Create a new matplotlib window if none exists to render
